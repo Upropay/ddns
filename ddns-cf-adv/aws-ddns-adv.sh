@@ -93,52 +93,56 @@ json_extract_records() {
                  content=""
                  proxied=""
                  comment=""
+                 have_type=0
+                 type_val=""
 
-                 while (match(line, /\"id\"[[:space:]]*:[[:space:]]*\"[0-9a-fA-F]{32}\"/)) {
+                 while (match(line, /"id"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]{32}"/)) {
                      s = substr(line, RSTART, RLENGTH)
-                     sub(/.*\"id\"[[:space:]]*:[[:space:]]*\"/, "", s)
-                     sub(/\".*/, "", s)
+                     sub(/.*"id"[[:space:]]*:[[:space:]]*"/, "", s)
+                     sub(/".*/, "", s)
                      id = s
-                     break
-                 }
-
-                 while (match(line, /\"type\"[[:space:]]*:[[:space:]]*\"[A-Z]+\"/)) {
-                     s = substr(line, RSTART, RLENGTH)
-                     sub(/.*\"type\"[[:space:]]*:[[:space:]]*\"/, "", s)
-                     sub(/\".*/, "", s)
-                     if (s != "A") { id = ""; break }
                      break
                  }
                  if (id == "") next
 
-                 while (match(line, /\"content\"[[:space:]]*:[[:space:]]*\"[0-9.]+\"/)) {
+                 while (match(line, /"type"[[:space:]]*:[[:space:]]*"[A-Z]+"/)) {
                      s = substr(line, RSTART, RLENGTH)
-                     sub(/.*\"content\"[[:space:]]*:[[:space:]]*\"/, "", s)
-                     sub(/\".*/, "", s)
+                     sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", s)
+                     sub(/".*/, "", s)
+                     have_type=1
+                     type_val=s
+                     break
+                 }
+                 if (have_type == 0 || type_val != "A") next
+
+                 while (match(line, /"content"[[:space:]]*:[[:space:]]*"[0-9.]+"/)) {
+                     s = substr(line, RSTART, RLENGTH)
+                     sub(/.*"content"[[:space:]]*:[[:space:]]*"/, "", s)
+                     sub(/".*/, "", s)
                      content = s
                      break
                  }
+                 if (content == "") next
 
-                 while (match(line, /\"proxied\"[[:space:]]*:[[:space:]]*(true|false)/)) {
+                 while (match(line, /"proxied"[[:space:]]*:[[:space:]]*(true|false)/)) {
                      s = substr(line, RSTART, RLENGTH)
-                     sub(/.*\"proxied\"[[:space:]]*:[[:space:]]*/, "", s)
+                     sub(/.*"proxied"[[:space:]]*:[[:space:]]*/, "", s)
                      proxied = s
                      break
                  }
 
-                 if (match(line, /\"comment\"[[:space:]]*:[[:space:]]*null/)) {
+                 if (match(line, /"comment"[[:space:]]*:[[:space:]]*null([,}[:space:]]|$)/)) {
                      comment = ""
-                 } else while (match(line, /\"comment\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/)) {
+                 } else if (match(line, /"comment"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
                      s = substr(line, RSTART, RLENGTH)
-                     sub(/.*\"comment\"[[:space:]]*:[[:space:]]*\"/, "", s)
-                     sub(/\".*/, "", s)
+                     sub(/.*"comment"[[:space:]]*:[[:space:]]*"/, "", s)
+                     sub(/".*/, "", s)
                      comment = s
-                     break
+                 } else {
+                     comment = ""
                  }
 
-                 if (id != "") {
-                     printf "%s\t%s\t%s\t%s\n", id, content, proxied, comment
-                 }
+                 printf "%s\t%s\t%s\t%s\n", id, content, (proxied=="" ? "false" : proxied), comment
              }'
 }
 
@@ -358,54 +362,62 @@ run_once() {
         exit 0
     fi
 
-    local my_ids=() my_contents=() my_proxieds=()
+    local my_ids=() my_contents=() my_proxieds=() my_comments=()
+    local unassigned_ids=() unassigned_contents=() unassigned_proxieds=()
+    declare -A other_origin_counts=()
     local i
     for (( i = 0; i < ${#all_ids[@]}; i++ )); do
-        if [[ "${all_comments[$i]}" == "$expected_comment" ]]; then
+        local c="${all_comments[$i]}"
+        if [[ "$c" == "$expected_comment" ]]; then
             my_ids+=("${all_ids[$i]}")
             my_contents+=("${all_contents[$i]}")
             my_proxieds+=("${all_proxieds[$i]}")
+            my_comments+=("$c")
+        elif [[ -z "$c" ]]; then
+            unassigned_ids+=("${all_ids[$i]}")
+            unassigned_contents+=("${all_contents[$i]}")
+            unassigned_proxieds+=("${all_proxieds[$i]}")
+        else
+            if [[ -n "${other_origin_counts[$c]:-}" ]]; then
+                other_origin_counts[$c]=$(( other_origin_counts[$c] + 1 ))
+            else
+                other_origin_counts[$c]=1
+            fi
         fi
     done
 
-    local adopted="" adopted_idx=""
-    if (( ${#my_ids[@]} == 0 )); then
-        for (( i = 0; i < ${#all_ids[@]}; i++ )); do
-            if [[ -z "${all_comments[$i]}" && "${all_contents[$i]}" == "$current_ip" ]]; then
-                adopted_idx="$i"
+    local oc_info="" oc_k
+    for oc_k in "${!other_origin_counts[@]}"; do
+        [[ -n "$oc_info" ]] && oc_info="${oc_info}, "
+        oc_info="${oc_info}${oc_k}=${other_origin_counts[$oc_k]}"
+    done
+
+    local adopted="" adopted_idx_in_unassigned=""
+    if (( ${#my_ids[@]} == 0 )) && (( ${#unassigned_ids[@]} > 0 )); then
+        local j
+        for (( j = 0; j < ${#unassigned_ids[@]}; j++ )); do
+            if [[ "${unassigned_contents[$j]}" == "$current_ip" ]]; then
+                adopted_idx_in_unassigned="$j"
                 break
             fi
         done
-        if [[ -z "$adopted_idx" ]]; then
-            local unclaimed=() unclaimed_ipmatch=""
-            for (( i = 0; i < ${#all_ids[@]}; i++ )); do
-                if [[ -z "${all_comments[$i]}" ]]; then
-                    unclaimed+=("$i")
-                    [[ "${all_contents[$i]}" == "$current_ip" ]] && unclaimed_ipmatch="$i"
-                fi
-            done
-            if (( ${#unclaimed[@]} == 1 )); then
-                adopted_idx="${unclaimed[0]}"
-            elif [[ -n "$unclaimed_ipmatch" ]]; then
-                adopted_idx="$unclaimed_ipmatch"
-            fi
-        fi
-        if [[ -n "$adopted_idx" ]]; then
+        if [[ -n "$adopted_idx_in_unassigned" ]]; then
             adopted="1"
-            my_ids+=("${all_ids[$adopted_idx]}")
-            my_contents+=("${all_contents[$adopted_idx]}")
-            my_proxieds+=("${all_proxieds[$adopted_idx]}")
-            echo "[origin:${origin_id}] 接管 1 条无归属历史记录（id=${all_ids[$adopted_idx]}，${all_contents[$adopted_idx]}），将在本次更新时写入归属 comment"
+            my_ids+=("${unassigned_ids[$adopted_idx_in_unassigned]}")
+            my_contents+=("${unassigned_contents[$adopted_idx_in_unassigned]}")
+            my_proxieds+=("${unassigned_proxieds[$adopted_idx_in_unassigned]}")
+            my_comments+=("")
+            echo "[origin:${origin_id}] 接管 1 条无归属历史记录（IP 与当前公网 IP 一致: $current_ip，id=${unassigned_ids[$adopted_idx_in_unassigned]}），将在本次写入归属 comment"
         fi
     fi
 
-    echo "[origin:${origin_id}] 检测到 $(( ${#my_ids[@]} )) 条归属自己的记录（总 ${#all_ids[@]} 条同名 A 记录）"
+    echo "[origin:${origin_id}] 检测到 $(( ${#my_ids[@]} )) 条归属自己的记录（总 ${#all_ids[@]} 条同名 A 记录；无归属 ${#unassigned_ids[@]} 条；其他 origin: ${oc_info:-无}）"
 
     if (( ${#my_ids[@]} > 1 )); then
-        echo "[origin:${origin_id}] 归属自己的记录重复 $(( ${#my_ids[@]} - 1 )) 条，保留第 1 条（${my_contents[0]}），清理其余"
+        echo "[origin:${origin_id}] 归属自己的记录重复 $(( ${#my_ids[@]} - 1 )) 条，保留第 1 条（id=${my_ids[0]}，IP=${my_contents[0]}），清理其余"
         for (( i = 1; i < ${#my_ids[@]}; i++ )); do
             cf_http_delete "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/${my_ids[$i]}" >/dev/null
-            echo "[origin:${origin_id}] 已删除自己的重复记录: ${my_ids[$i]}"
+            echo "[origin:${origin_id}] 已删除自己的重复记录: id=${my_ids[$i]} (IP=${my_contents[$i]})"
         done
     fi
 
@@ -425,19 +437,12 @@ run_once() {
     local my_content="${my_contents[0]}"
     local my_proxied="${my_proxieds[0]:-false}"
     local need_comment_patch="false"
-    if [[ -n "$adopted" ]]; then
+    if [[ "${my_comments[0]}" != "$expected_comment" ]]; then
         need_comment_patch="true"
-    else
-        for (( i = 0; i < ${#all_ids[@]}; i++ )); do
-            if [[ "${all_ids[$i]}" == "$my_id" && -z "${all_comments[$i]}" ]]; then
-                need_comment_patch="true"
-                break
-            fi
-        done
     fi
 
     if [[ "$my_content" == "$current_ip" && "$need_comment_patch" == "false" ]]; then
-        echo "[origin:${origin_id}] 记录已是目标 IPv4，无需更新: $record_name -> $current_ip"
+        echo "[origin:${origin_id}] 记录已是目标 IPv4，无需更新: $record_name -> $current_ip (id=$my_id)"
         exit 0
     fi
 
@@ -449,9 +454,9 @@ run_once() {
         exit 1
     fi
     if [[ "$my_content" == "$current_ip" ]]; then
-        echo "[origin:${origin_id}] IP 未变化，已补写归属 comment: $record_name -> $current_ip"
+        echo "[origin:${origin_id}] IP 未变化，已补写归属 comment: $record_name -> $current_ip (id=$my_id)"
     else
-        echo "[origin:${origin_id}] 已更新记录: $record_name $my_content -> $current_ip"
+        echo "[origin:${origin_id}] 已更新记录: $record_name $my_content -> $current_ip (id=$my_id, 仅操作自己的记录)"
     fi
 }
 
