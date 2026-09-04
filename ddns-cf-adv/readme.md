@@ -28,7 +28,7 @@
 | **Global API Key** | ⭐⭐ | ⚠️ 兼容 | 全账户权限，仅用于旧场景兼容 |
 
 ### 部署与运维
-- **一键安装 cron**：`--install-cron` 参数自动安装脚本、注册每小时整点定时任务、并立即执行一次；`--origin-id` 会自动通过 `ORIGIN_ID` 环境变量注入 crontab
+- **一键安装 cron**：`--install-cron` 参数自动安装脚本、注册每分钟定时任务、并立即执行一次；`--origin-id` 会自动通过 `ORIGIN_ID` 环境变量注入 crontab
 - **标准路径**：
   - 脚本安装位置：`/root/aws-ddns-adv.sh`
   - 定时任务日志：`/root/aws-ddns-adv.log`
@@ -298,7 +298,7 @@ run_once 主流程（按归属精细化管理）
 ```
 已从 https://github.com/Upropay/ddns/releases/download/1.0.0/aws-ddns-adv.sh 下载脚本到: /root/aws-ddns-adv.sh
 已安装脚本到: /root/aws-ddns-adv.sh
-已写入定时任务: 每小时整点执行一次
+已写入定时任务: 每分钟执行一次
 已创建记录: home.example.com -> 203.0.113.5
 ```
 
@@ -352,10 +352,10 @@ API 令牌鉴权失败。请确认:
 ```bash
 crontab -l
 # 示例（单机令牌模式）：
-# 0 * * * * CF_API_TOKEN='xxx' /bin/bash /root/aws-ddns-adv.sh example.com home.example.com >> /root/aws-ddns-adv.log 2>&1
+# */1 * * * * CF_API_TOKEN='xxx' /bin/bash /root/aws-ddns-adv.sh example.com home.example.com >> /root/aws-ddns-adv.log 2>&1
 #
 # 示例（负载均衡模式）：
-# 0 * * * * CF_API_TOKEN='xxx' ORIGIN_ID='yc-hk' /bin/bash /root/aws-ddns-adv.sh example.com home.example.com >> /root/aws-ddns-adv.log 2>&1
+# */1 * * * * CF_API_TOKEN='xxx' ORIGIN_ID='yc-hk' /bin/bash /root/aws-ddns-adv.sh example.com home.example.com >> /root/aws-ddns-adv.log 2>&1
 ```
 
 ### 查看执行日志

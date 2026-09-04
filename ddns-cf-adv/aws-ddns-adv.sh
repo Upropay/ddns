@@ -484,15 +484,15 @@ install_cron() {
     local cron_line existing
     if [[ -n "${cf_api_token:-}" ]]; then
         if [[ -n "${origin_id:-}" ]]; then
-            cron_line="0 * * * * CF_API_TOKEN='${cf_api_token}' ORIGIN_ID='${origin_id}' /bin/bash ${INSTALL_PATH} ${zone_name} ${record_name}"
+            cron_line="*/1 * * * * CF_API_TOKEN='${cf_api_token}' ORIGIN_ID='${origin_id}' /bin/bash ${INSTALL_PATH} ${zone_name} ${record_name}"
         else
-            cron_line="0 * * * * CF_API_TOKEN='${cf_api_token}' /bin/bash ${INSTALL_PATH} ${zone_name} ${record_name}"
+            cron_line="*/1 * * * * CF_API_TOKEN='${cf_api_token}' /bin/bash ${INSTALL_PATH} ${zone_name} ${record_name}"
         fi
     else
         if [[ -n "${origin_id:-}" ]]; then
-            cron_line="0 * * * * ORIGIN_ID='${origin_id}' /bin/bash ${INSTALL_PATH} ${auth_email} ${auth_key} ${zone_name} ${record_name}"
+            cron_line="*/1 * * * * ORIGIN_ID='${origin_id}' /bin/bash ${INSTALL_PATH} ${auth_email} ${auth_key} ${zone_name} ${record_name}"
         else
-            cron_line="0 * * * * /bin/bash ${INSTALL_PATH} ${auth_email} ${auth_key} ${zone_name} ${record_name}"
+            cron_line="*/1 * * * * /bin/bash ${INSTALL_PATH} ${auth_email} ${auth_key} ${zone_name} ${record_name}"
         fi
     fi
 
@@ -508,7 +508,7 @@ install_cron() {
     (printf '%s\n' "$existing"; printf '%s\n' "$cron_line") | crontab -
 
     echo "已安装脚本到: $INSTALL_PATH"
-    echo "已写入定时任务: 每小时整点执行一次"
+    echo "已写入定时任务: 每分钟执行一次"
     [[ -n "${origin_id:-}" ]] && echo "  服务器标识: origin:${origin_id}"
 
     local prev_origin="${ORIGIN_ID:-}"
