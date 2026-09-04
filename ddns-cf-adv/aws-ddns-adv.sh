@@ -151,6 +151,9 @@ setup_cf_headers() {
     cf_headers+=(-H "Content-Type: application/json")
 }
 
+CURL_API_OPTS=(--connect-timeout 5 --max-time 20 --retry 2 --retry-delay 1 --retry-max-time 40)
+CURL_IP_OPTS=(--connect-timeout 5 --max-time 15 --retry 2 --retry-delay 1 --retry-max-time 30)
+
 cf_fail_help() {
     local code="$1"
     echo "Cloudflare API 返回 HTTP ${code}。" >&2
@@ -178,7 +181,7 @@ cf_http_get() {
     local url="$1"
     local tmp body code
     tmp="$(mktemp)"
-    code="$(curl -sS -o "$tmp" -w "%{http_code}" -X GET "$url" "${cf_headers[@]}")" || {
+    code="$(curl -sS "${CURL_API_OPTS[@]}" -o "$tmp" -w "%{http_code}" -X GET "$url" "${cf_headers[@]}")" || {
         rm -f "$tmp"
         return 1
     }
@@ -204,7 +207,7 @@ cf_http_body() {
     local data="$3"
     local tmp body code
     tmp="$(mktemp)"
-    code="$(curl -sS -o "$tmp" -w "%{http_code}" -X "$method" "$url" "${cf_headers[@]}" --data "$data")" || {
+    code="$(curl -sS "${CURL_API_OPTS[@]}" -o "$tmp" -w "%{http_code}" -X "$method" "$url" "${cf_headers[@]}" --data "$data")" || {
         rm -f "$tmp"
         return 1
     }
@@ -228,7 +231,7 @@ cf_http_delete() {
     local url="$1"
     local tmp body code
     tmp="$(mktemp)"
-    code="$(curl -sS -o "$tmp" -w "%{http_code}" -X DELETE "$url" "${cf_headers[@]}")" || {
+    code="$(curl -sS "${CURL_API_OPTS[@]}" -o "$tmp" -w "%{http_code}" -X DELETE "$url" "${cf_headers[@]}")" || {
         rm -f "$tmp"
         return 1
     }
@@ -295,27 +298,40 @@ run_once() {
     local lock_key lock_dir lock_errcode=0
     lock_key="$(printf '%s|%s|%s' "$zone_name" "$record_name" "${origin_id:-__no_origin__}" | base64 | tr -d '\n=/')"
     lock_dir="/tmp/.aws-ddns-adv-${lock_key}.lock"
-    if ! mkdir "$lock_dir" 2>/dev/null; then
-        local age_s=""
-        age_s="$(date +%s 2>/dev/null || true)"
-        [[ -n "$age_s" && -d "$lock_dir" ]] && {
-            local mt st
-            mt="$(stat -c %Y "$lock_dir" 2>/dev/null || stat -f %m "$lock_dir" 2>/dev/null || true)"
-            if [[ -n "$mt" && -n "$age_s" ]] && (( age_s - mt > 600 )); then
-                echo "[锁超时 10min+] 已存在锁目录 $lock_dir，强制移除后重试"
-                rm -rf "$lock_dir"
-                if ! mkdir "$lock_dir" 2>/dev/null; then
-                    echo "[跳过] 已有相同任务在执行中（锁目录: $lock_dir），避免并发创建重复记录" >&2
-                    exit 0
-                fi
-            else
-                echo "[跳过] 已有相同任务在执行中（锁目录: $lock_dir），避免并发创建重复记录" >&2
-                exit 0
+    local pid_file="$lock_dir/pid"
+
+    acquire_lock() {
+        if mkdir "$lock_dir" 2>/dev/null; then
+            printf '%s' "$$" > "$pid_file"
+            return 0
+        fi
+        local old_pid=""
+        if [[ -f "$pid_file" ]]; then
+            old_pid="$(cat "$pid_file" 2>/dev/null || true)"
+        fi
+        local recovered="false"
+        if [[ -z "$old_pid" ]]; then
+            echo "[锁修复] 锁目录 $lock_dir 存在但没有 pid 文件，当作僵尸锁清理并重新获取"
+            rm -rf "$lock_dir"
+            if mkdir "$lock_dir" 2>/dev/null; then
+                printf '%s' "$$" > "$pid_file"
+                recovered="true"
             fi
-        } || {
-            echo "[跳过] 已有相同任务在执行中（锁目录: $lock_dir），避免并发创建重复记录" >&2
-            exit 0
-        }
+        elif ! kill -0 "$old_pid" 2>/dev/null; then
+            echo "[锁修复] 持有锁的进程 pid=$old_pid 已不存在（卡死/被杀），清理僵尸锁并重新获取"
+            rm -rf "$lock_dir"
+            if mkdir "$lock_dir" 2>/dev/null; then
+                printf '%s' "$$" > "$pid_file"
+                recovered="true"
+            fi
+        fi
+        if [[ "$recovered" == "true" ]]; then return 0; fi
+        return 1
+    }
+
+    if ! acquire_lock; then
+        echo "[跳过] 已有相同任务在执行中（锁目录: $lock_dir，pid=$(cat "$pid_file" 2>/dev/null || echo '?')），避免并发创建重复记录" >&2
+        exit 0
     fi
     trap 'rm -rf "$lock_dir"' EXIT
 
@@ -328,7 +344,7 @@ run_once() {
     local update_payload update_resp update_success
 
     if [[ -z "$current_ip" ]]; then
-        current_ip="$(curl -fsS https://ipv4.icanhazip.com | tr -d '[:space:]')"
+        current_ip="$(curl -fsS "${CURL_IP_OPTS[@]}" https://ipv4.icanhazip.com | tr -d '[:space:]')"
     fi
 
     if ! [[ "$current_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -336,7 +352,7 @@ run_once() {
         exit 1
     fi
 
-    zone_resp="$(cf_http_get "$(curl -sS -o /dev/null -w '%{url_effective}' -G 'https://api.cloudflare.com/client/v4/zones' --data-urlencode "name=${zone_name}")")"
+    zone_resp="$(cf_http_get "$(curl -sS "${CURL_API_OPTS[@]}" -o /dev/null -w '%{url_effective}' -G 'https://api.cloudflare.com/client/v4/zones' --data-urlencode "name=${zone_name}")")"
     zone_success="$(json_val "$zone_resp" "success")"
     if [[ "$zone_success" != "true" ]]; then
         echo "查询 Zone 失败: $zone_resp" >&2
@@ -349,7 +365,7 @@ run_once() {
         exit 1
     fi
 
-    record_url="$(curl -sS -o /dev/null -w '%{url_effective}' -G \
+    record_url="$(curl -sS "${CURL_API_OPTS[@]}" -o /dev/null -w '%{url_effective}' -G \
         "https://api.cloudflare.com/client/v4/zones/${zone_identifier}/dns_records" \
         --data-urlencode "type=A" \
         --data-urlencode "name=${record_name}")"
@@ -551,7 +567,7 @@ install_cron() {
             exit 1
         fi
         require_cmd curl
-        curl -fsSLo "$INSTALL_PATH" "$SCRIPT_URL"
+        curl -fsSL --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 -o "$INSTALL_PATH" "$SCRIPT_URL"
         echo "已从 $SCRIPT_URL 下载脚本到: $INSTALL_PATH"
     fi
     chmod +x "$INSTALL_PATH"
