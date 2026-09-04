@@ -94,33 +94,44 @@ json_extract_records() {
                  proxied=""
                  comment=""
 
-                 while (match(line, /"id"[[:space:]]*:[[:space:]]*"[0-9a-f]{32}"/)) {
+                 while (match(line, /\"id\"[[:space:]]*:[[:space:]]*\"[0-9a-fA-F]{32}\"/)) {
                      s = substr(line, RSTART, RLENGTH)
-                     sub(/.*"id"[[:space:]]*:[[:space:]]*"/, "", s)
-                     sub(/".*/, "", s)
+                     sub(/.*\"id\"[[:space:]]*:[[:space:]]*\"/, "", s)
+                     sub(/\".*/, "", s)
                      id = s
                      break
                  }
 
-                 while (match(line, /"content"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+                 while (match(line, /\"type\"[[:space:]]*:[[:space:]]*\"[A-Z]+\"/)) {
                      s = substr(line, RSTART, RLENGTH)
-                     sub(/.*"content"[[:space:]]*:[[:space:]]*"/, "", s)
-                     sub(/".*/, "", s)
+                     sub(/.*\"type\"[[:space:]]*:[[:space:]]*\"/, "", s)
+                     sub(/\".*/, "", s)
+                     if (s != "A") { id = ""; break }
+                     break
+                 }
+                 if (id == "") next
+
+                 while (match(line, /\"content\"[[:space:]]*:[[:space:]]*\"[0-9.]+\"/)) {
+                     s = substr(line, RSTART, RLENGTH)
+                     sub(/.*\"content\"[[:space:]]*:[[:space:]]*\"/, "", s)
+                     sub(/\".*/, "", s)
                      content = s
                      break
                  }
 
-                 while (match(line, /"proxied"[[:space:]]*:[[:space:]]*(true|false)/)) {
+                 while (match(line, /\"proxied\"[[:space:]]*:[[:space:]]*(true|false)/)) {
                      s = substr(line, RSTART, RLENGTH)
-                     sub(/.*"proxied"[[:space:]]*:[[:space:]]*/, "", s)
+                     sub(/.*\"proxied\"[[:space:]]*:[[:space:]]*/, "", s)
                      proxied = s
                      break
                  }
 
-                 while (match(line, /"comment"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+                 if (match(line, /\"comment\"[[:space:]]*:[[:space:]]*null/)) {
+                     comment = ""
+                 } else while (match(line, /\"comment\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/)) {
                      s = substr(line, RSTART, RLENGTH)
-                     sub(/.*"comment"[[:space:]]*:[[:space:]]*"/, "", s)
-                     sub(/".*/, "", s)
+                     sub(/.*\"comment\"[[:space:]]*:[[:space:]]*\"/, "", s)
+                     sub(/\".*/, "", s)
                      comment = s
                      break
                  }
@@ -322,6 +333,17 @@ run_once() {
         [[ -z "$record_proxied" ]] && record_proxied="false"
 
         if (( ${#all_ids[@]} == 0 )); then
+            local fallback_id
+            fallback_id="$(json_val "$record_resp" "id" result0)"
+            if [[ -n "$fallback_id" && -n "$record_content" ]]; then
+                all_ids+=("$fallback_id")
+                all_contents+=("$record_content")
+                all_proxieds+=("$record_proxied")
+                all_comments+=("")
+            fi
+        fi
+
+        if (( ${#all_ids[@]} == 0 )); then
             create_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":false}' "$record_name" "$current_ip")"
             create_resp="$(cf_http_body POST "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records" "$create_payload")"
             create_success="$(json_val "$create_resp" "success")"
@@ -334,6 +356,8 @@ run_once() {
         fi
 
         record_identifier="${all_ids[0]}"
+        record_content="${all_contents[0]}"
+        record_proxied="${all_proxieds[0]:-false}"
 
         if (( ${#all_ids[@]} > 1 )); then
             echo "检测到 ${#all_ids[@]} 条同名 A 记录，清理多余 $(( ${#all_ids[@]} - 1 )) 条"
@@ -357,6 +381,41 @@ run_once() {
         fi
         echo "已更新记录: $record_name $record_content -> $current_ip"
         exit 0
+    fi
+
+    local adopted="" adopted_idx=""
+    if (( ${#my_ids[@]} == 0 )); then
+        for (( i = 0; i < ${#all_ids[@]}; i++ )); do
+            if [[ -z "${all_comments[$i]}" ]]; then
+                if [[ "${all_contents[$i]}" == "$current_ip" ]]; then
+                    adopted_idx="$i"
+                    break
+                fi
+            fi
+        done
+        if [[ -z "$adopted_idx" ]]; then
+            local unclaimed=() unclaimed_ipmatch=""
+            for (( i = 0; i < ${#all_ids[@]}; i++ )); do
+                if [[ -z "${all_comments[$i]}" ]]; then
+                    unclaimed+=("$i")
+                    [[ "${all_contents[$i]}" == "$current_ip" ]] && unclaimed_ipmatch="$i"
+                fi
+            done
+            if (( ${#unclaimed[@]} == 1 )); then
+                adopted_idx="${unclaimed[0]}"
+            elif [[ -n "$unclaimed_ipmatch" ]]; then
+                adopted_idx="$unclaimed_ipmatch"
+            elif (( ${#unclaimed[@]} > 1 )); then
+                adopted_idx="${unclaimed[0]}"
+            fi
+        fi
+        if [[ -n "$adopted_idx" ]]; then
+            adopted="adopted"
+            my_ids+=("${all_ids[$adopted_idx]}")
+            my_contents+=("${all_contents[$adopted_idx]}")
+            my_proxieds+=("${all_proxieds[$adopted_idx]}")
+            echo "[origin:${origin_id}] 接管了 1 条无归属的历史记录（id=${all_ids[$adopted_idx]}，${all_contents[$adopted_idx]}），本次更新将写入归属 comment"
+        fi
     fi
 
     echo "[origin:${origin_id}] 检测到 $(( ${#my_ids[@]} )) 条归属自己的记录（总 ${#all_ids[@]} 条同名 A 记录）"
@@ -388,8 +447,20 @@ run_once() {
     local my_id="${my_ids[0]}"
     local my_content="${my_contents[0]}"
     local my_proxied="${my_proxieds[0]:-false}"
+    local need_comment_patch="false"
+    if [[ -n "$adopted" || -z "${all_comments[$adopted_idx]}" && -n "$expected_comment" ]]; then
+        need_comment_patch="true"
+    fi
+    if [[ -z "$adopted" ]]; then
+        for (( i = 0; i < ${#all_ids[@]}; i++ )); do
+            if [[ "${all_ids[$i]}" == "$my_id" && -z "${all_comments[$i]}" && -n "$expected_comment" ]]; then
+                need_comment_patch="true"
+                break
+            fi
+        done
+    fi
 
-    if [[ "$my_content" == "$current_ip" ]]; then
+    if [[ "$my_content" == "$current_ip" && "$need_comment_patch" == "false" ]]; then
         echo "[origin:${origin_id}] 记录已是目标 IPv4，无需更新: $record_name -> $current_ip"
         exit 0
     fi
@@ -405,7 +476,11 @@ run_once() {
         echo "更新记录失败: $update_resp" >&2
         exit 1
     fi
-    echo "[origin:${origin_id}] 已更新记录: $record_name $my_content -> $current_ip"
+    if [[ "$my_content" == "$current_ip" ]]; then
+        echo "[origin:${origin_id}] IP 未变化，已补写归属 comment: $record_name -> $current_ip"
+    else
+        echo "[origin:${origin_id}] 已更新记录: $record_name $my_content -> $current_ip"
+    fi
 }
 
 install_cron() {
