@@ -442,6 +442,54 @@ run_once() {
         exit 0
     fi
 
+    # ========= Preflight：宽松匹配强制去重（兜底，不依赖解析器精确 comment 相等） =========
+    # Cloudflare UI / 历史写入 / 不同机器并发导致同 origin:xxx 名下出现 2+ 条，
+    # 即使 json_extract_records 的 comment 精确匹配因转义/换行等漏算，这里也用
+    # case 字符串包含匹配 expected_comment 做二次扫描，多于 1 条时只保留第 1 条，
+    # 其余全部 DELETE，保证同 origin-id 名下最终只剩 1 条。
+    if [[ -n "${origin_id:-}" && -n "$expected_comment" && ${#all_ids[@]} -gt 1 ]]; then
+        local loose_mine_ids=() loose_mine_contents=() i c
+        for (( i = 0; i < ${#all_ids[@]}; i++ )); do
+            c="${all_comments[$i]:-}"
+            if [[ "$c" == "$expected_comment" || "$c" == *"$expected_comment"* ]]; then
+                loose_mine_ids+=("${all_ids[$i]}")
+                loose_mine_contents+=("${all_contents[$i]}")
+            fi
+        done
+        if (( ${#loose_mine_ids[@]} > 1 )); then
+            echo "[origin:${origin_id}] [Preflight宽松去重] 检测到归属名下 ${#loose_mine_ids[@]} 条记录，保留 id=${loose_mine_ids[0]} (IP=${loose_mine_contents[0]})，删除剩余 $(( ${#loose_mine_ids[@]} - 1 )) 条"
+            for (( i = 1; i < ${#loose_mine_ids[@]}; i++ )); do
+                cf_http_delete "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/${loose_mine_ids[$i]}" >/dev/null || true
+                echo "[origin:${origin_id}] [Preflight宽松去重] 已删除重复记录 id=${loose_mine_ids[$i]} (IP=${loose_mine_contents[$i]})"
+            done
+            # 删除之后重新拉一次 list，刷新 all_* 数组，避免后面分类还带着已删 id
+            local refreshed
+            record_resp="$(cf_http_get "$record_url")" || refreshed="fail"
+            if [[ "${refreshed:-}" != "fail" ]]; then
+                record_success="$(json_val "$record_resp" "success")"
+                if [[ "$record_success" == "true" ]]; then
+                    local _ids=() _contents=() _proxieds=() _comments=()
+                    local _tsv _line _rid _rcontent _rproxied _rcomment
+                    _tsv="$(json_extract_records "$record_resp")"
+                    while IFS= read -r _line; do
+                        [[ -z "$_line" ]] && continue
+                        IFS=$'\t' read -r _rid _rcontent _rproxied _rcomment <<< "$_line"
+                        [[ -z "$_rid" ]] && continue
+                        _ids+=("$_rid")
+                        _contents+=("$_rcontent")
+                        _proxieds+=("${_rproxied:-false}")
+                        _comments+=("$_rcomment")
+                    done <<< "$_tsv"
+                    all_ids=("${_ids[@]}")
+                    all_contents=("${_contents[@]}")
+                    all_proxieds=("${_proxieds[@]}")
+                    all_comments=("${_comments[@]}")
+                    unset _ids _contents _proxieds _comments _tsv _line _rid _rcontent _rproxied _rcomment
+                fi
+            fi
+        fi
+    fi
+
     local my_ids=() my_contents=() my_proxieds=() my_comments=()
     local unassigned_ids=() unassigned_contents=() unassigned_proxieds=()
     declare -A other_origin_counts=()
