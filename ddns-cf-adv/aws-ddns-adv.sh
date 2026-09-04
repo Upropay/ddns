@@ -2,7 +2,7 @@
 # 本脚本用于更新 Cloudflare 域名的 A 记录，支持定时任务与多 IP 负载均衡（DNS Round Robin）
 set -euo pipefail
 
-SCRIPT_URL="${SCRIPT_URL:-https://github.com/Upropay/ddns/releases/download/1.0.0/aws-ddns-adv-n6.sh}"
+SCRIPT_URL="${SCRIPT_URL:-https://github.com/Upropay/ddns/releases/download/1.0.0/aws-ddns-adv.sh}"
 INSTALL_PATH="/root/aws-ddns-adv.sh"
 LOG_PATH="/root/aws-ddns-adv.log"
 ORIGIN_PREFIX="origin:"
