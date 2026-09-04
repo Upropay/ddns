@@ -313,84 +313,67 @@ run_once() {
         all_comments+=("$rcomment")
     done <<< "$records_tsv"
 
+    if (( ${#all_ids[@]} == 0 )); then
+        local fallback_id fallback_content fallback_proxied
+        fallback_id="$(json_val "$record_resp" "id" result0)"
+        fallback_content="$(json_val "$record_resp" "content" result0)"
+        fallback_proxied="$(json_val "$record_resp" "proxied" result0)"
+        if [[ -n "$fallback_id" && -n "$fallback_content" ]]; then
+            all_ids+=("$fallback_id")
+            all_contents+=("$fallback_content")
+            all_proxieds+=("${fallback_proxied:-false}")
+            all_comments+=("")
+        fi
+    fi
+
+    if [[ -z "${origin_id:-}" ]]; then
+        echo "检测到 ${#all_ids[@]} 条同名 A 记录（当前目标 IP: $current_ip）"
+
+        local existing_idx=""
+        local i
+        for (( i = 0; i < ${#all_ids[@]}; i++ )); do
+            if [[ "${all_contents[$i]}" == "$current_ip" ]]; then
+                existing_idx="$i"
+                break
+            fi
+        done
+
+        if [[ -n "$existing_idx" ]]; then
+            echo "当前 IP 已在记录中（索引 ${existing_idx}，id=${all_ids[$existing_idx]}），无需更新: $record_name -> $current_ip"
+            exit 0
+        fi
+
+        if (( ${#all_ids[@]} > 0 )); then
+            echo "当前 IP 不在 ${#all_ids[@]} 条已有记录中，新增记录"
+        fi
+
+        create_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":false}' "$record_name" "$current_ip")"
+        create_resp="$(cf_http_body POST "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records" "$create_payload")"
+        create_success="$(json_val "$create_resp" "success")"
+        if [[ "$create_success" != "true" ]]; then
+            echo "创建记录失败: $create_resp" >&2
+            exit 1
+        fi
+        echo "已创建记录: $record_name -> $current_ip（当前总计 $(( ${#all_ids[@]} + 1 )) 条同名 A 记录）"
+        exit 0
+    fi
+
     local my_ids=() my_contents=() my_proxieds=()
     local i
     for (( i = 0; i < ${#all_ids[@]}; i++ )); do
-        if [[ -n "${origin_id:-}" ]]; then
-            if [[ "${all_comments[$i]}" == "$expected_comment" ]]; then
-                my_ids+=("${all_ids[$i]}")
-                my_contents+=("${all_contents[$i]}")
-                my_proxieds+=("${all_proxieds[$i]}")
-            fi
+        if [[ "${all_comments[$i]}" == "$expected_comment" ]]; then
+            my_ids+=("${all_ids[$i]}")
+            my_contents+=("${all_contents[$i]}")
+            my_proxieds+=("${all_proxieds[$i]}")
         fi
     done
-
-    if [[ -z "${origin_id:-}" ]]; then
-        local record_content record_proxied record_identifier
-
-        record_content="$(json_val "$record_resp" "content" result0)"
-        record_proxied="$(json_val "$record_resp" "proxied" result0)"
-        [[ -z "$record_proxied" ]] && record_proxied="false"
-
-        if (( ${#all_ids[@]} == 0 )); then
-            local fallback_id
-            fallback_id="$(json_val "$record_resp" "id" result0)"
-            if [[ -n "$fallback_id" && -n "$record_content" ]]; then
-                all_ids+=("$fallback_id")
-                all_contents+=("$record_content")
-                all_proxieds+=("$record_proxied")
-                all_comments+=("")
-            fi
-        fi
-
-        if (( ${#all_ids[@]} == 0 )); then
-            create_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":false}' "$record_name" "$current_ip")"
-            create_resp="$(cf_http_body POST "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records" "$create_payload")"
-            create_success="$(json_val "$create_resp" "success")"
-            if [[ "$create_success" != "true" ]]; then
-                echo "创建记录失败: $create_resp" >&2
-                exit 1
-            fi
-            echo "已创建记录: $record_name -> $current_ip"
-            exit 0
-        fi
-
-        record_identifier="${all_ids[0]}"
-        record_content="${all_contents[0]}"
-        record_proxied="${all_proxieds[0]:-false}"
-
-        if (( ${#all_ids[@]} > 1 )); then
-            echo "检测到 ${#all_ids[@]} 条同名 A 记录，清理多余 $(( ${#all_ids[@]} - 1 )) 条"
-            for (( i = 1; i < ${#all_ids[@]}; i++ )); do
-                cf_http_delete "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/${all_ids[$i]}" >/dev/null
-                echo "已删除重复记录: ${all_ids[$i]}"
-            done
-        fi
-
-        if [[ "$record_content" == "$current_ip" && ${#all_ids[@]} -eq 1 ]]; then
-            echo "记录已是目标 IPv4，无需更新: $record_name -> $current_ip"
-            exit 0
-        fi
-
-        update_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":%s}' "$record_name" "$current_ip" "$record_proxied")"
-        update_resp="$(cf_http_body PUT "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/$record_identifier" "$update_payload")"
-        update_success="$(json_val "$update_resp" "success")"
-        if [[ "$update_success" != "true" ]]; then
-            echo "更新记录失败: $update_resp" >&2
-            exit 1
-        fi
-        echo "已更新记录: $record_name $record_content -> $current_ip"
-        exit 0
-    fi
 
     local adopted="" adopted_idx=""
     if (( ${#my_ids[@]} == 0 )); then
         for (( i = 0; i < ${#all_ids[@]}; i++ )); do
-            if [[ -z "${all_comments[$i]}" ]]; then
-                if [[ "${all_contents[$i]}" == "$current_ip" ]]; then
-                    adopted_idx="$i"
-                    break
-                fi
+            if [[ -z "${all_comments[$i]}" && "${all_contents[$i]}" == "$current_ip" ]]; then
+                adopted_idx="$i"
+                break
             fi
         done
         if [[ -z "$adopted_idx" ]]; then
@@ -405,23 +388,21 @@ run_once() {
                 adopted_idx="${unclaimed[0]}"
             elif [[ -n "$unclaimed_ipmatch" ]]; then
                 adopted_idx="$unclaimed_ipmatch"
-            elif (( ${#unclaimed[@]} > 1 )); then
-                adopted_idx="${unclaimed[0]}"
             fi
         fi
         if [[ -n "$adopted_idx" ]]; then
-            adopted="adopted"
+            adopted="1"
             my_ids+=("${all_ids[$adopted_idx]}")
             my_contents+=("${all_contents[$adopted_idx]}")
             my_proxieds+=("${all_proxieds[$adopted_idx]}")
-            echo "[origin:${origin_id}] 接管了 1 条无归属的历史记录（id=${all_ids[$adopted_idx]}，${all_contents[$adopted_idx]}），本次更新将写入归属 comment"
+            echo "[origin:${origin_id}] 接管 1 条无归属历史记录（id=${all_ids[$adopted_idx]}，${all_contents[$adopted_idx]}），将在本次更新时写入归属 comment"
         fi
     fi
 
     echo "[origin:${origin_id}] 检测到 $(( ${#my_ids[@]} )) 条归属自己的记录（总 ${#all_ids[@]} 条同名 A 记录）"
 
     if (( ${#my_ids[@]} > 1 )); then
-        echo "[origin:${origin_id}] 自己的记录重复 $(( ${#my_ids[@]} - 1 )) 条，保留第一条，清理其余"
+        echo "[origin:${origin_id}] 归属自己的记录重复 $(( ${#my_ids[@]} - 1 )) 条，保留第 1 条（${my_contents[0]}），清理其余"
         for (( i = 1; i < ${#my_ids[@]}; i++ )); do
             cf_http_delete "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/${my_ids[$i]}" >/dev/null
             echo "[origin:${origin_id}] 已删除自己的重复记录: ${my_ids[$i]}"
@@ -429,11 +410,7 @@ run_once() {
     fi
 
     if (( ${#my_ids[@]} == 0 )); then
-        if [[ -n "$expected_comment" ]]; then
-            create_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":false,"comment":"%s"}' "$record_name" "$current_ip" "$expected_comment")"
-        else
-            create_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":false}' "$record_name" "$current_ip")"
-        fi
+        create_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":false,"comment":"%s"}' "$record_name" "$current_ip" "$expected_comment")"
         create_resp="$(cf_http_body POST "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records" "$create_payload")"
         create_success="$(json_val "$create_resp" "success")"
         if [[ "$create_success" != "true" ]]; then
@@ -448,12 +425,11 @@ run_once() {
     local my_content="${my_contents[0]}"
     local my_proxied="${my_proxieds[0]:-false}"
     local need_comment_patch="false"
-    if [[ -n "$adopted" || -z "${all_comments[$adopted_idx]}" && -n "$expected_comment" ]]; then
+    if [[ -n "$adopted" ]]; then
         need_comment_patch="true"
-    fi
-    if [[ -z "$adopted" ]]; then
+    else
         for (( i = 0; i < ${#all_ids[@]}; i++ )); do
-            if [[ "${all_ids[$i]}" == "$my_id" && -z "${all_comments[$i]}" && -n "$expected_comment" ]]; then
+            if [[ "${all_ids[$i]}" == "$my_id" && -z "${all_comments[$i]}" ]]; then
                 need_comment_patch="true"
                 break
             fi
@@ -465,11 +441,7 @@ run_once() {
         exit 0
     fi
 
-    if [[ -n "$expected_comment" ]]; then
-        update_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":%s,"comment":"%s"}' "$record_name" "$current_ip" "$my_proxied" "$expected_comment")"
-    else
-        update_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":%s}' "$record_name" "$current_ip" "$my_proxied")"
-    fi
+    update_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":%s,"comment":"%s"}' "$record_name" "$current_ip" "$my_proxied" "$expected_comment")"
     update_resp="$(cf_http_body PUT "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/$my_id" "$update_payload")"
     update_success="$(json_val "$update_resp" "success")"
     if [[ "$update_success" != "true" ]]; then
