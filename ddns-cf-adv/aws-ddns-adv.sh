@@ -620,7 +620,7 @@ install_cron() {
     fi
     chmod +x "$INSTALL_PATH"
 
-    local cron_line existing
+    local cron_line existing tmp_cron
     if [[ -n "${cf_api_token:-}" ]]; then
         if [[ -n "${origin_id:-}" ]]; then
             cron_line="*/1 * * * * CF_API_TOKEN='${cf_api_token}' ORIGIN_ID='${origin_id}' /bin/bash ${INSTALL_PATH} ${zone_name} ${record_name}"
@@ -639,15 +639,40 @@ install_cron() {
         cron_line="${cron_line} ${ip}"
     fi
 
+    # cron 规范：% 会被 crond 当成换行，需要转义为 \%（日志路径里常见但我们用 >> $LOG_PATH，LOG_PATH 默认无%）
+    cron_line="${cron_line//%/\\%}"
     cron_line="${cron_line} >> ${LOG_PATH} 2>&1"
 
+    # 读现有 crontab：空 crontab/首次安装 crontab -l 会 exit 1，兜底为空
+    existing=""
     existing="$(crontab -l 2>/dev/null || true)"
-    existing="$(printf '%s\n' "$existing" | grep -Fv "$INSTALL_PATH" || true)"
 
-    (printf '%s\n' "$existing"; printf '%s\n' "$cron_line") | crontab -
+    # 用临时文件构造新 crontab，避免管道子 shell + grep 空输入返回 1 触发 set -euo pipefail
+    tmp_cron="$(mktemp)"
+    # 先把原有非当前脚本的行写进去（避免已有任务被覆盖/空 crontab 导致 grep 返回码 1 触发 set -e）
+    if [[ -n "$existing" ]]; then
+        printf '%s\n' "$existing" | grep -Fv "$INSTALL_PATH" > "$tmp_cron" 2>/dev/null || true
+    fi
+    # 追加新 cron 行，保证 tmp_cron 最后一定以换行结尾（crontab 规范）
+    printf '%s\n' "$cron_line" >> "$tmp_cron"
+    # 安装，并输出安装后 crontab 中对应行做自检
+    if crontab "$tmp_cron" 2>/dev/null; then
+        echo "已写入 crontab，安装后匹配的任务行:"
+        crontab -l 2>/dev/null | grep -F "$INSTALL_PATH" || true
+    else
+        echo "安装 crontab 失败，尝试用管道方式回退写入:" >&2
+        crontab -l 2>/dev/null | { cat; echo "$cron_line"; } | crontab - 2>/dev/null || {
+            echo "crontab 写入失败，请检查系统是否安装 cron 服务或 /usr/bin/crontab 是否有 setuid 权限" >&2
+            rm -f "$tmp_cron"
+            exit 1
+        }
+        echo "（回退方式）已写入，安装后匹配的任务行:"
+        crontab -l 2>/dev/null | grep -F "$INSTALL_PATH" || true
+    fi
+    rm -f "$tmp_cron"
 
     echo "已安装脚本到: $INSTALL_PATH"
-    echo "已写入定时任务: 每分钟执行一次"
+    echo "已写入定时任务: 每分钟执行一次（日志: $LOG_PATH）"
     [[ -n "${origin_id:-}" ]] && echo "  服务器标识: origin:${origin_id}"
 
     local prev_origin="${ORIGIN_ID:-}"
