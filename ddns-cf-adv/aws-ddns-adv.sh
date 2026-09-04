@@ -1,29 +1,41 @@
 #!/usr/bin/env bash
-# 本脚本用于更新 AWS Route 53 域名的 A 记录，支持定时任务
+# 本脚本用于更新 Cloudflare 域名的 A 记录，支持定时任务与多 IP 负载均衡（DNS Round Robin）
 set -euo pipefail
 
 SCRIPT_URL="${SCRIPT_URL:-https://ddns.8245454.xyz/aws4.sh}"
 INSTALL_PATH="/root/setDomainRecorder.sh"
 LOG_PATH="/root/setDomainRecorder.log"
+ORIGIN_PREFIX="origin:"
 
 usage() {
     cat <<'EOF'
 用法:
   推荐使用 API 令牌（Bearer Token）:
-    单次执行:  setDomainRecorder.sh --token <api_token> <zone_name> <record_name> [ip]
-    安装定时:  setDomainRecorder.sh --install-cron --token <api_token> <zone_name> <record_name> [ip]
+    单次执行:  aws-ddns-adv.sh --token <api_token> [--origin-id <id>] <zone_name> <record_name> [ip]
+    安装定时:  aws-ddns-adv.sh --install-cron --token <api_token> [--origin-id <id>] <zone_name> <record_name> [ip]
 
   兼容旧版 Global API Key:
-    单次执行:  setDomainRecorder.sh <auth_email> <auth_key> <zone_name> <record_name> [ip]
-    安装定时:  setDomainRecorder.sh --install-cron <auth_email> <auth_key> <zone_name> <record_name> [ip]
+    单次执行:  aws-ddns-adv.sh <auth_email> <auth_key> [--origin-id <id>] <zone_name> <record_name> [ip]
+    安装定时:  aws-ddns-adv.sh --install-cron <auth_email> <auth_key> [--origin-id <id>] <zone_name> <record_name> [ip]
 
 环境变量:
   CF_API_TOKEN   API 令牌；与 --token 等价，可省略 --token
+  ORIGIN_ID      服务器唯一标识；与 --origin-id 等价，多机负载均衡场景必填
   SCRIPT_URL     自定义脚本下载地址（仅 --install-cron 使用）
 
 API 令牌所需权限:
   Zone : Zone : Read   定位 zone
   Zone : DNS  : Edit   读取与更新 A 记录
+
+多机负载均衡 (DNS Round Robin) 说明:
+  在多台服务器上同时运行本脚本并分别指定不同的 --origin-id，即可实现一个
+  二级域名解析到多个公网 IP。每台服务器只会创建/更新/清理属于自己的那条
+  A 记录（通过 DNS 记录的 comment 字段标记归属：origin:<origin-id>），
+  不会触碰其他服务器的记录，并发安全。
+
+示例:
+  服务器 A:  aws-ddns-adv.sh --token XXX --origin-id server-a example.com home.example.com
+  服务器 B:  aws-ddns-adv.sh --token XXX --origin-id server-b example.com home.example.com
 EOF
 }
 
@@ -69,6 +81,54 @@ json_val() {
 
 json_errors_message() {
     printf '%s' "$1" | sed -nE 's/.*"message"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -n1
+}
+
+json_extract_records() {
+    local raw="$1"
+    printf '%s' "$raw" \
+        | awk 'BEGIN{ RS="{"; ORS="" }
+             {
+                 line=$0
+                 id=""
+                 content=""
+                 proxied=""
+                 comment=""
+
+                 while (match(line, /"id"[[:space:]]*:[[:space:]]*"[0-9a-f]{32}"/)) {
+                     s = substr(line, RSTART, RLENGTH)
+                     sub(/.*"id"[[:space:]]*:[[:space:]]*"/, "", s)
+                     sub(/".*/, "", s)
+                     id = s
+                     break
+                 }
+
+                 while (match(line, /"content"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+                     s = substr(line, RSTART, RLENGTH)
+                     sub(/.*"content"[[:space:]]*:[[:space:]]*"/, "", s)
+                     sub(/".*/, "", s)
+                     content = s
+                     break
+                 }
+
+                 while (match(line, /"proxied"[[:space:]]*:[[:space:]]*(true|false)/)) {
+                     s = substr(line, RSTART, RLENGTH)
+                     sub(/.*"proxied"[[:space:]]*:[[:space:]]*/, "", s)
+                     proxied = s
+                     break
+                 }
+
+                 while (match(line, /"comment"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+                     s = substr(line, RSTART, RLENGTH)
+                     sub(/.*"comment"[[:space:]]*:[[:space:]]*"/, "", s)
+                     sub(/".*/, "", s)
+                     comment = s
+                     break
+                 }
+
+                 if (id != "") {
+                     printf "%s\t%s\t%s\t%s\n", id, content, proxied, comment
+                 }
+             }'
 }
 
 setup_cf_headers() {
@@ -179,13 +239,17 @@ cf_http_delete() {
     esac
 }
 
+build_comment() {
+    local oid="$1"
+    [[ -n "$oid" ]] && printf '%s%s' "$ORIGIN_PREFIX" "$oid" || printf ''
+}
+
 run_once() {
     setup_cf_headers
 
     local current_ip="${ip:-}"
     local zone_resp zone_success zone_identifier
     local record_url record_resp record_success
-    local record_identifier record_content record_proxied
     local create_payload create_resp create_success
     local update_payload update_resp update_success
 
@@ -222,61 +286,126 @@ run_once() {
         exit 1
     fi
 
-    # 取出该名称下所有 A 记录的 ID（可能存在重复记录）
-    local ids_raw
-    ids_raw="$(printf '%s' "$record_resp" | grep -oE '"id":"[0-9a-f]{32}"' | sed -E 's/"id":"([0-9a-f]{32})"/\1/' || true)"
+    local expected_comment
+    expected_comment="$(build_comment "${origin_id:-}")"
 
-    local record_ids=()
-    local line
+    local all_ids=() all_contents=() all_proxieds=() all_comments=()
+    local records_tsv line rid rcontent rproxied rcomment
+    records_tsv="$(json_extract_records "$record_resp")"
     while IFS= read -r line; do
-        [[ -n "$line" ]] && record_ids+=("$line")
-    done <<< "$ids_raw"
+        [[ -z "$line" ]] && continue
+        IFS=$'\t' read -r rid rcontent rproxied rcomment <<< "$line"
+        [[ -z "$rid" ]] && continue
+        all_ids+=("$rid")
+        all_contents+=("$rcontent")
+        all_proxieds+=("${rproxied:-false}")
+        all_comments+=("$rcomment")
+    done <<< "$records_tsv"
 
-    record_content="$(json_val "$record_resp" "content" result0)"
-    record_proxied="$(json_val "$record_resp" "proxied" result0)"
-    if [[ -z "$record_proxied" ]]; then
-        record_proxied="false"
+    local my_ids=() my_contents=() my_proxieds=()
+    local i
+    for (( i = 0; i < ${#all_ids[@]}; i++ )); do
+        if [[ -n "${origin_id:-}" ]]; then
+            if [[ "${all_comments[$i]}" == "$expected_comment" ]]; then
+                my_ids+=("${all_ids[$i]}")
+                my_contents+=("${all_contents[$i]}")
+                my_proxieds+=("${all_proxieds[$i]}")
+            fi
+        fi
+    done
+
+    if [[ -z "${origin_id:-}" ]]; then
+        local record_content record_proxied record_identifier
+
+        record_content="$(json_val "$record_resp" "content" result0)"
+        record_proxied="$(json_val "$record_resp" "proxied" result0)"
+        [[ -z "$record_proxied" ]] && record_proxied="false"
+
+        if (( ${#all_ids[@]} == 0 )); then
+            create_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":false}' "$record_name" "$current_ip")"
+            create_resp="$(cf_http_body POST "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records" "$create_payload")"
+            create_success="$(json_val "$create_resp" "success")"
+            if [[ "$create_success" != "true" ]]; then
+                echo "创建记录失败: $create_resp" >&2
+                exit 1
+            fi
+            echo "已创建记录: $record_name -> $current_ip"
+            exit 0
+        fi
+
+        record_identifier="${all_ids[0]}"
+
+        if (( ${#all_ids[@]} > 1 )); then
+            echo "检测到 ${#all_ids[@]} 条同名 A 记录，清理多余 $(( ${#all_ids[@]} - 1 )) 条"
+            for (( i = 1; i < ${#all_ids[@]}; i++ )); do
+                cf_http_delete "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/${all_ids[$i]}" >/dev/null
+                echo "已删除重复记录: ${all_ids[$i]}"
+            done
+        fi
+
+        if [[ "$record_content" == "$current_ip" && ${#all_ids[@]} -eq 1 ]]; then
+            echo "记录已是目标 IPv4，无需更新: $record_name -> $current_ip"
+            exit 0
+        fi
+
+        update_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":%s}' "$record_name" "$current_ip" "$record_proxied")"
+        update_resp="$(cf_http_body PUT "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/$record_identifier" "$update_payload")"
+        update_success="$(json_val "$update_resp" "success")"
+        if [[ "$update_success" != "true" ]]; then
+            echo "更新记录失败: $update_resp" >&2
+            exit 1
+        fi
+        echo "已更新记录: $record_name $record_content -> $current_ip"
+        exit 0
     fi
 
-    # 没有任何记录：创建一条
-    if (( ${#record_ids[@]} == 0 )); then
-        create_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":false}' "$record_name" "$current_ip")"
+    echo "[origin:${origin_id}] 检测到 $(( ${#my_ids[@]} )) 条归属自己的记录（总 ${#all_ids[@]} 条同名 A 记录）"
+
+    if (( ${#my_ids[@]} > 1 )); then
+        echo "[origin:${origin_id}] 自己的记录重复 $(( ${#my_ids[@]} - 1 )) 条，保留第一条，清理其余"
+        for (( i = 1; i < ${#my_ids[@]}; i++ )); do
+            cf_http_delete "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/${my_ids[$i]}" >/dev/null
+            echo "[origin:${origin_id}] 已删除自己的重复记录: ${my_ids[$i]}"
+        done
+    fi
+
+    if (( ${#my_ids[@]} == 0 )); then
+        if [[ -n "$expected_comment" ]]; then
+            create_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":false,"comment":"%s"}' "$record_name" "$current_ip" "$expected_comment")"
+        else
+            create_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":false}' "$record_name" "$current_ip")"
+        fi
         create_resp="$(cf_http_body POST "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records" "$create_payload")"
         create_success="$(json_val "$create_resp" "success")"
         if [[ "$create_success" != "true" ]]; then
             echo "创建记录失败: $create_resp" >&2
             exit 1
         fi
-        echo "已创建记录: $record_name -> $current_ip"
+        echo "[origin:${origin_id}] 已创建记录: $record_name -> $current_ip"
         exit 0
     fi
 
-    record_identifier="${record_ids[0]}"
+    local my_id="${my_ids[0]}"
+    local my_content="${my_contents[0]}"
+    local my_proxied="${my_proxieds[0]:-false}"
 
-    # 存在多条同名记录：保留第一条，删除其余重复记录
-    if (( ${#record_ids[@]} > 1 )); then
-        echo "检测到 ${#record_ids[@]} 条同名 A 记录，清理多余 $(( ${#record_ids[@]} - 1 )) 条"
-        local i
-        for (( i = 1; i < ${#record_ids[@]}; i++ )); do
-            cf_http_delete "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/${record_ids[$i]}" >/dev/null
-            echo "已删除重复记录: ${record_ids[$i]}"
-        done
-    fi
-
-    if [[ "$record_content" == "$current_ip" && ${#record_ids[@]} -eq 1 ]]; then
-        echo "记录已是目标 IPv4，无需更新: $record_name -> $current_ip"
+    if [[ "$my_content" == "$current_ip" ]]; then
+        echo "[origin:${origin_id}] 记录已是目标 IPv4，无需更新: $record_name -> $current_ip"
         exit 0
     fi
 
-    update_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":%s}' "$record_name" "$current_ip" "$record_proxied")"
-    update_resp="$(cf_http_body PUT "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/$record_identifier" "$update_payload")"
+    if [[ -n "$expected_comment" ]]; then
+        update_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":%s,"comment":"%s"}' "$record_name" "$current_ip" "$my_proxied" "$expected_comment")"
+    else
+        update_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":%s}' "$record_name" "$current_ip" "$my_proxied")"
+    fi
+    update_resp="$(cf_http_body PUT "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/$my_id" "$update_payload")"
     update_success="$(json_val "$update_resp" "success")"
     if [[ "$update_success" != "true" ]]; then
         echo "更新记录失败: $update_resp" >&2
         exit 1
     fi
-
-    echo "已更新记录: $record_name $record_content -> $current_ip"
+    echo "[origin:${origin_id}] 已更新记录: $record_name $my_content -> $current_ip"
 }
 
 install_cron() {
@@ -307,9 +436,17 @@ install_cron() {
 
     local cron_line existing
     if [[ -n "${cf_api_token:-}" ]]; then
-        cron_line="* * * * * CF_API_TOKEN='${cf_api_token}' /bin/bash ${INSTALL_PATH} ${zone_name} ${record_name}"
+        if [[ -n "${origin_id:-}" ]]; then
+            cron_line="* * * * * CF_API_TOKEN='${cf_api_token}' ORIGIN_ID='${origin_id}' /bin/bash ${INSTALL_PATH} ${zone_name} ${record_name}"
+        else
+            cron_line="* * * * * CF_API_TOKEN='${cf_api_token}' /bin/bash ${INSTALL_PATH} ${zone_name} ${record_name}"
+        fi
     else
-        cron_line="* * * * * /bin/bash ${INSTALL_PATH} ${auth_email} ${auth_key} ${zone_name} ${record_name}"
+        if [[ -n "${origin_id:-}" ]]; then
+            cron_line="* * * * * ORIGIN_ID='${origin_id}' /bin/bash ${INSTALL_PATH} ${auth_email} ${auth_key} ${zone_name} ${record_name}"
+        else
+            cron_line="* * * * * /bin/bash ${INSTALL_PATH} ${auth_email} ${auth_key} ${zone_name} ${record_name}"
+        fi
     fi
 
     if [[ -n "${ip:-}" ]]; then
@@ -325,15 +462,28 @@ install_cron() {
 
     echo "已安装脚本到: $INSTALL_PATH"
     echo "已写入定时任务: 每分钟执行一次"
+    [[ -n "${origin_id:-}" ]] && echo "  服务器标识: origin:${origin_id}"
+
+    local prev_origin="${ORIGIN_ID:-}"
+    if [[ -n "${origin_id:-}" ]]; then
+        ORIGIN_ID="${origin_id}"
+    fi
 
     if [[ -n "${cf_api_token:-}" ]]; then
         CF_API_TOKEN="${cf_api_token}" /bin/bash "$INSTALL_PATH" "$zone_name" "$record_name" ${ip:+$ip}
     else
         /bin/bash "$INSTALL_PATH" "$auth_email" "$auth_key" "$zone_name" "$record_name" ${ip:+$ip}
     fi
+
+    if [[ -n "${prev_origin:-}" ]]; then
+        ORIGIN_ID="$prev_origin"
+    else
+        unset ORIGIN_ID
+    fi
 }
 
 cf_api_token="${CF_API_TOKEN:-}"
+origin_id="${ORIGIN_ID:-}"
 auth_email=""
 auth_key=""
 zone_name=""
@@ -350,6 +500,15 @@ while (( $# )); do
             ;;
         --install-cron)
             install_mode=1
+            shift
+            ;;
+        --origin-id)
+            [[ $# -ge 2 ]] || { echo "--origin-id 需要参数" >&2; exit 1; }
+            origin_id="$2"
+            shift 2
+            ;;
+        --origin-id=*)
+            origin_id="${1#*=}"
             shift
             ;;
         --token)
@@ -396,6 +555,7 @@ fi
 
 require_cmd curl
 require_cmd sed
+require_cmd awk
 
 if (( install_mode )); then
     install_cron
