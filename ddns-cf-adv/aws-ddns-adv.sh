@@ -131,16 +131,10 @@ json_extract_records() {
                      break
                  }
 
-                 if (match(line, /"comment"[[:space:]]*:[[:space:]]*null([,}[:space:]]|$)/)) {
-                     comment = ""
-                 } else if (match(line, /"comment"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
-                     s = substr(line, RSTART, RLENGTH)
-                     sub(/.*"comment"[[:space:]]*:[[:space:]]*"/, "", s)
-                     sub(/".*/, "", s)
-                     comment = s
-                 } else {
-                     comment = ""
-                 }
+                 if (match(line, /"comment"[[:space:]]*:[[:space:]]*null/)) comment = ""
+                 else if (match(line, /"comment"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+                     s = substr(line, RSTART, RLENGTH); sub(/.*"comment"[[:space:]]*:[[:space:]]*"/, "", s); sub(/".*/, "", s); comment = s
+                 } else comment = ""
 
                  printf "%s\t%s\t%s\t%s\n", id, content, (proxied=="" ? "false" : proxied), comment
              }'
@@ -259,7 +253,72 @@ build_comment() {
     [[ -n "$oid" ]] && printf '%s%s' "$ORIGIN_PREFIX" "$oid" || printf ''
 }
 
+verify_and_repair_record() {
+    local zone_identifier="$1" record_name="$2" record_id="$3" expect_ip="$4" expect_comment="$5" label_prefix="${6:-}"
+    local verify_url verify_resp verify_success v_content v_comment v_proxied
+    verify_url="https://api.cloudflare.com/client/v4/zones/${zone_identifier}/dns_records/${record_id}"
+    verify_resp="$(cf_http_get "$verify_url")"
+    verify_success="$(json_val "$verify_resp" "success")"
+    if [[ "$verify_success" != "true" ]]; then
+        echo "${label_prefix}[警告] 创建/更新后校验失败（GET 单条未成功），将跳过后续补修，下一轮再处理: $verify_resp" >&2
+        return 0
+    fi
+    v_content="$(json_val "$verify_resp" "content" result0)"
+    v_proxied="$(json_val "$verify_resp" "proxied" result0)"
+    v_comment="$(json_val "$verify_resp" "comment" result0)"
+    local mismatch="false"
+    if [[ -n "$expect_ip" && "$v_content" != "$expect_ip" ]]; then mismatch="true"; fi
+    if [[ -n "$expect_comment" && "$v_comment" != "$expect_comment" ]]; then mismatch="true"; fi
+
+    if [[ "$mismatch" == "false" ]]; then
+        echo "${label_prefix}[校验通过] id=$record_id content=$v_content comment=${v_comment:-<空>}"
+        return 0
+    fi
+
+    echo "${label_prefix}[校验不一致] id=$record_id 期望(content=$expect_ip comment=${expect_comment:-<空>})，实际(content=$v_content comment=${v_comment:-<空>})，自动补 PUT 修复"
+    local fix_payload fix_resp fix_success
+    fix_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":%s,"comment":"%s"}' \
+        "$record_name" \
+        "${expect_ip:-$v_content}" \
+        "${v_proxied:-false}" \
+        "${expect_comment:-${v_comment:-}}")"
+    fix_resp="$(cf_http_body PUT "https://api.cloudflare.com/client/v4/zones/${zone_identifier}/dns_records/${record_id}" "$fix_payload")"
+    fix_success="$(json_val "$fix_resp" "success")"
+    if [[ "$fix_success" == "true" ]]; then
+        echo "${label_prefix}[补修成功] id=$record_id 已强制写入 content=${expect_ip:-$v_content} comment=${expect_comment:-${v_comment:-<空>}}"
+    else
+        echo "${label_prefix}[补修失败] id=$record_id 补 PUT 返回: $fix_resp" >&2
+    fi
+}
+
 run_once() {
+    local lock_key lock_dir lock_errcode=0
+    lock_key="$(printf '%s|%s|%s' "$zone_name" "$record_name" "${origin_id:-__no_origin__}" | base64 | tr -d '\n=/')"
+    lock_dir="/tmp/.aws-ddns-adv-${lock_key}.lock"
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        local age_s=""
+        age_s="$(date +%s 2>/dev/null || true)"
+        [[ -n "$age_s" && -d "$lock_dir" ]] && {
+            local mt st
+            mt="$(stat -c %Y "$lock_dir" 2>/dev/null || stat -f %m "$lock_dir" 2>/dev/null || true)"
+            if [[ -n "$mt" && -n "$age_s" ]] && (( age_s - mt > 600 )); then
+                echo "[锁超时 10min+] 已存在锁目录 $lock_dir，强制移除后重试"
+                rm -rf "$lock_dir"
+                if ! mkdir "$lock_dir" 2>/dev/null; then
+                    echo "[跳过] 已有相同任务在执行中（锁目录: $lock_dir），避免并发创建重复记录" >&2
+                    exit 0
+                fi
+            else
+                echo "[跳过] 已有相同任务在执行中（锁目录: $lock_dir），避免并发创建重复记录" >&2
+                exit 0
+            fi
+        } || {
+            echo "[跳过] 已有相同任务在执行中（锁目录: $lock_dir），避免并发创建重复记录" >&2
+            exit 0
+        }
+    fi
+    trap 'rm -rf "$lock_dir"' EXIT
+
     setup_cf_headers
 
     local current_ip="${ip:-}"
@@ -358,7 +417,12 @@ run_once() {
             echo "创建记录失败: $create_resp" >&2
             exit 1
         fi
-        echo "已创建记录: $record_name -> $current_ip（当前总计 $(( ${#all_ids[@]} + 1 )) 条同名 A 记录）"
+        local created_id=""
+        created_id="$(json_val "$create_resp" "id" result0)"
+        echo "已创建记录: $record_name -> $current_ip（id=$created_id，当前总计 $(( ${#all_ids[@]} + 1 )) 条同名 A 记录）"
+        if [[ -n "$created_id" ]]; then
+            verify_and_repair_record "$zone_identifier" "$record_name" "$created_id" "$current_ip" "" ""
+        fi
         exit 0
     fi
 
@@ -429,7 +493,12 @@ run_once() {
             echo "创建记录失败: $create_resp" >&2
             exit 1
         fi
-        echo "[origin:${origin_id}] 已创建记录: $record_name -> $current_ip"
+        local created_id=""
+        created_id="$(json_val "$create_resp" "id" result0)"
+        echo "[origin:${origin_id}] 已创建记录: $record_name -> $current_ip (id=$created_id)"
+        if [[ -n "$created_id" ]]; then
+            verify_and_repair_record "$zone_identifier" "$record_name" "$created_id" "$current_ip" "$expected_comment" "[origin:${origin_id}] "
+        fi
         exit 0
     fi
 
@@ -458,6 +527,7 @@ run_once() {
     else
         echo "[origin:${origin_id}] 已更新记录: $record_name $my_content -> $current_ip (id=$my_id, 仅操作自己的记录)"
     fi
+    verify_and_repair_record "$zone_identifier" "$record_name" "$my_id" "$current_ip" "$expected_comment" "[origin:${origin_id}] "
 }
 
 install_cron() {
