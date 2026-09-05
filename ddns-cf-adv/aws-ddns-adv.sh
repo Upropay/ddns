@@ -6,6 +6,9 @@ SCRIPT_URL="${SCRIPT_URL:-https://github.com/Upropay/ddns/releases/download/1.0.
 INSTALL_PATH="/root/aws-ddns-adv.sh"
 LOG_PATH="/root/aws-ddns-adv.log"
 ORIGIN_PREFIX="origin:"
+STATE_DIR="/root/.aws-ddns-adv"
+STATE_FILE_PREFIX="state"
+STATE_FILE_VERSION="1"
 
 usage() {
     cat <<'EOF'
@@ -153,6 +156,45 @@ setup_cf_headers() {
 
 CURL_API_OPTS=(--connect-timeout 5 --max-time 20 --retry 2 --retry-delay 1 --retry-max-time 40)
 CURL_IP_OPTS=(--connect-timeout 5 --max-time 15 --retry 2 --retry-delay 1 --retry-max-time 30)
+
+build_state_file() {
+    local zone_name="$1" record_name="$2" origin_id="${3:-}"
+    local key
+    key="$(printf '%s|%s|%s' "$zone_name" "$record_name" "${origin_id:-__no_origin__}" | base64 | tr -d '\n=/')"
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    printf '%s/%s-%s' "$STATE_DIR" "$STATE_FILE_PREFIX" "$key"
+}
+
+save_state_record_id() {
+    local zone_name="$1" record_name="$2" origin_id="${3:-}" record_id="$4"
+    local f expected_comment=""
+    f="$(build_state_file "$zone_name" "$record_name" "$origin_id")"
+    expected_comment="$(build_comment "${origin_id:-}")"
+    {
+        printf 'version=%s\n' "$STATE_FILE_VERSION"
+        printf 'updated_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+        printf 'zone_name=%s\n' "$zone_name"
+        printf 'record_name=%s\n' "$record_name"
+        printf 'origin_id=%s\n' "${origin_id:-}"
+        printf 'expected_comment=%s\n' "$expected_comment"
+        printf 'record_id=%s\n' "$record_id"
+    } > "$f"
+}
+
+load_state_record_id() {
+    local zone_name="$1" record_name="$2" origin_id="${3:-}"
+    local f line k v
+    f="$(build_state_file "$zone_name" "$record_name" "$origin_id")"
+    [[ -f "$f" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^([A-Za-z0-9_]+)=(.*)$ ]] || continue
+        k="${BASH_REMATCH[1]}"
+        v="${BASH_REMATCH[2]}"
+        case "$k" in
+            record_id) printf '%s' "$v" ; return 0 ;;
+        esac
+    done < "$f"
+}
 
 cf_fail_help() {
     local code="$1"
@@ -442,114 +484,58 @@ run_once() {
         exit 0
     fi
 
-    # ========= Preflight：宽松匹配强制去重（兜底，不依赖解析器精确 comment 相等） =========
-    # Cloudflare UI / 历史写入 / 不同机器并发导致同 origin:xxx 名下出现 2+ 条，
-    # 即使 json_extract_records 的 comment 精确匹配因转义/换行等漏算，这里也用
-    # case 字符串包含匹配 expected_comment 做二次扫描，多于 1 条时只保留第 1 条，
-    # 其余全部 DELETE，保证同 origin-id 名下最终只剩 1 条。
-    if [[ -n "${origin_id:-}" && -n "$expected_comment" && ${#all_ids[@]} -gt 1 ]]; then
-        local loose_mine_ids=() loose_mine_contents=() i c
+    # ========= RR 多 origin 模式：本地 state 优先，永远只对一个固定 record id 发 PUT =========
+    # 设计原则（彻底解决「删除失败导致重复堆积」与「comment 解析不准导致抢错」）：
+    #  1) 本机 state 文件中的 record_id 才是真·唯一键；comment 只是可写可丢的标签，不做决策依据。
+    #  2) 正常路径：state 有 id → 直接 GET /dns_records/:id → 存在就 PUT（更新 content/comment），绝不 DELETE。
+    #  3) GET /dns_records/:id 返回 404（记录被手动删了）→ 才 POST 创建 1 条，写回新 id 到 state，仅此 1 种情况允许 POST。
+    #  4) state 没有 id 时：先做一次 list 宽松找归属（comment 包含 origin:xxx）→ 找到了把这个 id 写 state，下轮直接 PUT；
+    #     list 找不到 → POST 1 条写 state；list 中找到 >1 条（历史遗留重复）→ 只挑 1 条写 state（不删其他，避免 DELETE 失败再堆）。
+    local managed_id="" managed_content="" managed_proxied="false" managed_comment=""
+    managed_id="$(load_state_record_id "$zone_name" "$record_name" "$origin_id")"
+
+    pick_loose_one_and_save() {
+        # 从宽松匹配 loose_mine_ids 里挑 1 条做 managed，写 state；没匹配返回空
+        local chosen_id="" chosen_content="" chosen_proxied="false" chosen_comment="" i c
         for (( i = 0; i < ${#all_ids[@]}; i++ )); do
             c="${all_comments[$i]:-}"
             if [[ "$c" == "$expected_comment" || "$c" == *"$expected_comment"* ]]; then
-                loose_mine_ids+=("${all_ids[$i]}")
-                loose_mine_contents+=("${all_contents[$i]}")
-            fi
-        done
-        if (( ${#loose_mine_ids[@]} > 1 )); then
-            echo "[origin:${origin_id}] [Preflight宽松去重] 检测到归属名下 ${#loose_mine_ids[@]} 条记录，保留 id=${loose_mine_ids[0]} (IP=${loose_mine_contents[0]})，删除剩余 $(( ${#loose_mine_ids[@]} - 1 )) 条"
-            for (( i = 1; i < ${#loose_mine_ids[@]}; i++ )); do
-                cf_http_delete "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/${loose_mine_ids[$i]}" >/dev/null || true
-                echo "[origin:${origin_id}] [Preflight宽松去重] 已删除重复记录 id=${loose_mine_ids[$i]} (IP=${loose_mine_contents[$i]})"
-            done
-            # 删除之后重新拉一次 list，刷新 all_* 数组，避免后面分类还带着已删 id
-            local refreshed
-            record_resp="$(cf_http_get "$record_url")" || refreshed="fail"
-            if [[ "${refreshed:-}" != "fail" ]]; then
-                record_success="$(json_val "$record_resp" "success")"
-                if [[ "$record_success" == "true" ]]; then
-                    local _ids=() _contents=() _proxieds=() _comments=()
-                    local _tsv _line _rid _rcontent _rproxied _rcomment
-                    _tsv="$(json_extract_records "$record_resp")"
-                    while IFS= read -r _line; do
-                        [[ -z "$_line" ]] && continue
-                        IFS=$'\t' read -r _rid _rcontent _rproxied _rcomment <<< "$_line"
-                        [[ -z "$_rid" ]] && continue
-                        _ids+=("$_rid")
-                        _contents+=("$_rcontent")
-                        _proxieds+=("${_rproxied:-false}")
-                        _comments+=("$_rcomment")
-                    done <<< "$_tsv"
-                    all_ids=("${_ids[@]}")
-                    all_contents=("${_contents[@]}")
-                    all_proxieds=("${_proxieds[@]}")
-                    all_comments=("${_comments[@]}")
-                    unset _ids _contents _proxieds _comments _tsv _line _rid _rcontent _rproxied _rcomment
-                fi
-            fi
-        fi
-    fi
-
-    local my_ids=() my_contents=() my_proxieds=() my_comments=()
-    local unassigned_ids=() unassigned_contents=() unassigned_proxieds=()
-    declare -A other_origin_counts=()
-    local i
-    for (( i = 0; i < ${#all_ids[@]}; i++ )); do
-        local c="${all_comments[$i]}"
-        if [[ "$c" == "$expected_comment" ]]; then
-            my_ids+=("${all_ids[$i]}")
-            my_contents+=("${all_contents[$i]}")
-            my_proxieds+=("${all_proxieds[$i]}")
-            my_comments+=("$c")
-        elif [[ -z "$c" ]]; then
-            unassigned_ids+=("${all_ids[$i]}")
-            unassigned_contents+=("${all_contents[$i]}")
-            unassigned_proxieds+=("${all_proxieds[$i]}")
-        else
-            if [[ -n "${other_origin_counts[$c]:-}" ]]; then
-                other_origin_counts[$c]=$(( other_origin_counts[$c] + 1 ))
-            else
-                other_origin_counts[$c]=1
-            fi
-        fi
-    done
-
-    local oc_info="" oc_k
-    for oc_k in "${!other_origin_counts[@]}"; do
-        [[ -n "$oc_info" ]] && oc_info="${oc_info}, "
-        oc_info="${oc_info}${oc_k}=${other_origin_counts[$oc_k]}"
-    done
-
-    local adopted="" adopted_idx_in_unassigned=""
-    if (( ${#my_ids[@]} == 0 )) && (( ${#unassigned_ids[@]} > 0 )); then
-        local j
-        for (( j = 0; j < ${#unassigned_ids[@]}; j++ )); do
-            if [[ "${unassigned_contents[$j]}" == "$current_ip" ]]; then
-                adopted_idx_in_unassigned="$j"
+                chosen_id="${all_ids[$i]}"
+                chosen_content="${all_contents[$i]}"
+                chosen_proxied="${all_proxieds[$i]:-false}"
+                chosen_comment="$c"
                 break
             fi
         done
-        if [[ -n "$adopted_idx_in_unassigned" ]]; then
-            adopted="1"
-            my_ids+=("${unassigned_ids[$adopted_idx_in_unassigned]}")
-            my_contents+=("${unassigned_contents[$adopted_idx_in_unassigned]}")
-            my_proxieds+=("${unassigned_proxieds[$adopted_idx_in_unassigned]}")
-            my_comments+=("")
-            echo "[origin:${origin_id}] 接管 1 条无归属历史记录（IP 与当前公网 IP 一致: $current_ip，id=${unassigned_ids[$adopted_idx_in_unassigned]}），将在本次写入归属 comment"
+        if [[ -z "$chosen_id" ]]; then
+            # 退一步：comment 精确匹配为空但 IP 相同（无归属遗留 + 没 comment）→ 尝试接手
+            for (( i = 0; i < ${#all_ids[@]}; i++ )); do
+                local ic="${all_comments[$i]:-}"
+                if [[ -z "$ic" && "${all_contents[$i]}" == "$current_ip" ]]; then
+                    chosen_id="${all_ids[$i]}"
+                    chosen_content="${all_contents[$i]}"
+                    chosen_proxied="${all_proxieds[$i]:-false}"
+                    chosen_comment=""
+                    echo "[origin:${origin_id}] 发现 1 条无归属、无 comment、IP 恰好等于当前公网 IP 的历史记录 (id=$chosen_id, IP=$current_ip)，写入本地 state 并托管"
+                    break
+                fi
+            done
         fi
-    fi
+        if [[ -n "$chosen_id" ]]; then
+            managed_id="$chosen_id"
+            managed_content="$chosen_content"
+            managed_proxied="$chosen_proxied"
+            managed_comment="$chosen_comment"
+            save_state_record_id "$zone_name" "$record_name" "$origin_id" "$managed_id"
+            echo "[origin:${origin_id}] [State初始化] 本地 state 空，从 list 托管 id=$managed_id (IP=$managed_content, comment=${managed_comment:-<空>})"
+            return 0
+        fi
+        return 1
+    }
 
-    echo "[origin:${origin_id}] 检测到 $(( ${#my_ids[@]} )) 条归属自己的记录（总 ${#all_ids[@]} 条同名 A 记录；无归属 ${#unassigned_ids[@]} 条；其他 origin: ${oc_info:-无}）"
-
-    if (( ${#my_ids[@]} > 1 )); then
-        echo "[origin:${origin_id}] 归属自己的记录重复 $(( ${#my_ids[@]} - 1 )) 条，保留第 1 条（id=${my_ids[0]}，IP=${my_contents[0]}），清理其余"
-        for (( i = 1; i < ${#my_ids[@]}; i++ )); do
-            cf_http_delete "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/${my_ids[$i]}" >/dev/null
-            echo "[origin:${origin_id}] 已删除自己的重复记录: id=${my_ids[$i]} (IP=${my_contents[$i]})"
-        done
-    fi
-
-    if (( ${#my_ids[@]} == 0 )); then
+    do_post_create_and_save() {
+        # 唯一允许 POST 创建的入口；成功后立即写 state + 校验
+        local create_payload create_resp create_success created_id
         create_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":false,"comment":"%s"}' "$record_name" "$current_ip" "$expected_comment")"
         create_resp="$(cf_http_body POST "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records" "$create_payload")"
         create_success="$(json_val "$create_resp" "success")"
@@ -557,41 +543,87 @@ run_once() {
             echo "创建记录失败: $create_resp" >&2
             exit 1
         fi
-        local created_id=""
         created_id="$(json_val "$create_resp" "id" result0)"
-        echo "[origin:${origin_id}] 已创建记录: $record_name -> $current_ip (id=$created_id)"
+        echo "[origin:${origin_id}] [POST创建] state 里无可用 id，list 也没匹配，新建记录 id=$created_id IP=$current_ip"
         if [[ -n "$created_id" ]]; then
+            save_state_record_id "$zone_name" "$record_name" "$origin_id" "$created_id"
             verify_and_repair_record "$zone_identifier" "$record_name" "$created_id" "$current_ip" "$expected_comment" "[origin:${origin_id}] "
         fi
-        exit 0
-    fi
+        managed_id="$created_id"
+        managed_content="$current_ip"
+        managed_proxied="false"
+        managed_comment="$expected_comment"
+    }
 
-    local my_id="${my_ids[0]}"
-    local my_content="${my_contents[0]}"
-    local my_proxied="${my_proxieds[0]:-false}"
-    local need_comment_patch="false"
-    if [[ "${my_comments[0]}" != "$expected_comment" ]]; then
-        need_comment_patch="true"
-    fi
+    do_put_update_and_verify() {
+        # 固定 id PUT：更新 IP + comment + proxied；成功后立即校验
+        local my_id="$1" old_content="$2" old_proxied="$3" old_comment="$4" new_ip="$5" new_comment="$6"
+        local update_payload update_resp update_success need_comment need_ip tag=""
+        need_comment="true"
+        need_ip="true"
+        if [[ "$old_content" == "$new_ip" ]]; then need_ip="false"; fi
+        if [[ "$old_comment" == "$new_comment" ]]; then need_comment="false"; fi
+        if [[ "$need_ip" == "false" && "$need_comment" == "false" ]]; then
+            echo "[origin:${origin_id}] 记录已是目标 IPv4，无需更新: $record_name -> $new_ip (id=$my_id)"
+            verify_and_repair_record "$zone_identifier" "$record_name" "$my_id" "$new_ip" "$new_comment" "[origin:${origin_id}] "
+            return 0
+        fi
+        update_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":%s,"comment":"%s"}' "$record_name" "$new_ip" "${old_proxied:-false}" "$new_comment")"
+        update_resp="$(cf_http_body PUT "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/$my_id" "$update_payload")"
+        update_success="$(json_val "$update_resp" "success")"
+        if [[ "$update_success" != "true" ]]; then
+            echo "更新记录失败: $update_resp" >&2
+            exit 1
+        fi
+        if [[ "$need_ip" == "false" ]]; then
+            tag="IP 未变化，已补写归属 comment"
+        else
+            tag="已更新记录: $record_name $old_content -> $new_ip (仅操作自己的托管 id=$my_id)"
+        fi
+        echo "[origin:${origin_id}] $tag"
+        verify_and_repair_record "$zone_identifier" "$record_name" "$my_id" "$new_ip" "$new_comment" "[origin:${origin_id}] "
+    }
 
-    if [[ "$my_content" == "$current_ip" && "$need_comment_patch" == "false" ]]; then
-        echo "[origin:${origin_id}] 记录已是目标 IPv4，无需更新: $record_name -> $current_ip (id=$my_id)"
-        exit 0
-    fi
-
-    update_payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":%s,"comment":"%s"}' "$record_name" "$current_ip" "$my_proxied" "$expected_comment")"
-    update_resp="$(cf_http_body PUT "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/$my_id" "$update_payload")"
-    update_success="$(json_val "$update_resp" "success")"
-    if [[ "$update_success" != "true" ]]; then
-        echo "更新记录失败: $update_resp" >&2
-        exit 1
-    fi
-    if [[ "$my_content" == "$current_ip" ]]; then
-        echo "[origin:${origin_id}] IP 未变化，已补写归属 comment: $record_name -> $current_ip (id=$my_id)"
+    # ========== 主流程 ==========
+    if [[ -n "$managed_id" ]]; then
+        # Path A：本地 state 有 id → 直接 GET /dns_records/:id，绝不看 list 的 comment 归属决策
+        local single_url single_resp single_code single_success actual_content actual_comment actual_proxied
+        single_url="https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records/$managed_id"
+        single_resp="$(cf_http_get "$single_url")"
+        single_success="$(json_val "$single_resp" "success")"
+        single_code="$(json_val "$single_resp" "code" errors0 || true)"
+        if [[ "$single_success" != "true" && ( "$single_code" == "1061" || "$single_code" == "7003" || -z "$single_code" ) ]]; then
+            # 1061=record not found，7003=resource not found；state 里记录被手动删了 → 走回退（先 list 捡一条，捡不到就 POST 1 条）
+            echo "[origin:${origin_id}] [State过期] 本地 state id=$managed_id 在 Cloudflare 已不存在（手动删除？），回退用 list 找归属或 POST 新建"
+            managed_id=""
+            managed_content=""
+            if pick_loose_one_and_save; then
+                do_put_update_and_verify "$managed_id" "$managed_content" "$managed_proxied" "$managed_comment" "$current_ip" "$expected_comment"
+            else
+                do_post_create_and_save
+            fi
+        elif [[ "$single_success" == "true" ]]; then
+            actual_content="$(json_val "$single_resp" "content" result0)"
+            actual_comment="$(json_val "$single_resp" "comment" result0)"
+            actual_proxied="$(json_val "$single_resp" "proxied" result0)"
+            [[ -z "$actual_proxied" ]] && actual_proxied="false"
+            managed_content="$actual_content"
+            managed_comment="${actual_comment:-}"
+            managed_proxied="$actual_proxied"
+            echo "[origin:${origin_id}] [State命中] 使用本地 state 托管 id=$managed_id 当前 IP=$managed_content comment=${managed_comment:-<空>}"
+            do_put_update_and_verify "$managed_id" "$managed_content" "$managed_proxied" "$managed_comment" "$current_ip" "$expected_comment"
+        else
+            echo "[origin:${origin_id}] GET id=$managed_id 失败: $single_resp" >&2
+            exit 1
+        fi
     else
-        echo "[origin:${origin_id}] 已更新记录: $record_name $my_content -> $current_ip (id=$my_id, 仅操作自己的记录)"
+        # Path B：本地 state 为空（首次运行 / state 文件被删）
+        if pick_loose_one_and_save; then
+            do_put_update_and_verify "$managed_id" "$managed_content" "$managed_proxied" "$managed_comment" "$current_ip" "$expected_comment"
+        else
+            do_post_create_and_save
+        fi
     fi
-    verify_and_repair_record "$zone_identifier" "$record_name" "$my_id" "$current_ip" "$expected_comment" "[origin:${origin_id}] "
 }
 
 install_cron() {
